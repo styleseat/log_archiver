@@ -1,0 +1,7 @@
+isort
+flake8
+mock
+pip-tools
+pytest>2.0.0,<3.0.0  # assertion introspection is broken in pytest 3.0.0-3.0.3
+pytest-cov
+tox

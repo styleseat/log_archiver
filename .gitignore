@@ -1,0 +1,17 @@
+# Ignore hidden files unless they're explicitly exempted
+.*
+!.gitignore
+!.coveragerc
+
+# Vim temporaries and buffers
+*.sw?
+*~
+
+# Local python files
+*.py[oc]
+*.egg-info/
+MANIFEST
+
+# Local configuration file
+config.yml
+
