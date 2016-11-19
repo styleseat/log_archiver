@@ -14,6 +14,7 @@ import textwrap
 import time
 
 import boto3
+import botocore.client
 import watchdog.events
 import watchdog.observers
 import yaml
@@ -151,7 +152,10 @@ class S3Archiver(object):
         s3_options = self.s3_options
         extra_args = dict(Metadata=metadata)
         extra_args.update(s3_options.get('extra_args', {}))
-        s3 = boto3.resource('s3', region_name=s3_options['region'])
+        s3 = boto3.resource(
+            's3',
+            region_name=s3_options['region'],
+            config=botocore.client.Config(signature_version='s3v4'))
         s3_object = s3.Object(self.bucket, ''.join((self.path_prefix, key)))
         s3_object.upload_file(
             path,

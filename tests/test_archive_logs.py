@@ -301,7 +301,10 @@ class TestS3Archiver(object):
         s3_object = mock.Mock()
         mock_boto.resource.return_value = mock.Mock(Object=s3_object)
         archiver(str(log_path))
-        mock_boto.resource.assert_called_once_with('s3', region_name=region)
+        mock_boto.resource.assert_called_once_with(
+            's3',
+            region_name=region,
+            config=mock.ANY)
         s3_object.assert_called_once_with(archiver.bucket, key)
         s3_object.return_value.upload_file.assert_called_once_with(
             str(log_path), ExtraArgs=dict(extra_args, Metadata=metadata))
