@@ -5,7 +5,7 @@ from setuptools import setup
 
 setup(
     name='log_archiver',
-    version='0.2.1',
+    version='0.3.0',
     author='StyleSeat',
     description='Tools for log archival',
     url='https://github.com/styleseat/log_archiver',
