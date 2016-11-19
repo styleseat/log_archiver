@@ -1,24 +1,29 @@
 from __future__ import absolute_import
 
+import argparse
 import base64
 import copy
 import datetime
 import fnmatch
 import functools
 import hashlib
+import os
 import random
 import re
 import sys
 import uuid
 
 import mock
+import py.path
 import pytest
 import watchdog.events
+import watchdog.observers.api
 import yaml
 
 from log_archiver import archive_logs
 from log_archiver.archive_logs import (
-    LogEventHandler, S3Archiver, configure_watchers, main)
+    LogEventHandler, S3Archiver, configure_watchers, main,
+    process_observed_files, time_interval)
 
 try:
     range = xrange
@@ -45,42 +50,66 @@ def log_event_handler(log_event_handler_pattern, log_event_handler_action):
 class TestLogEventHandler(object):
     @staticmethod
     @pytest.fixture
-    def path():
-        return 'example.log'
+    def file_path(tmpdir):
+        path = tmpdir / 'example.log'
+        path.write('')
+        return str(path)
 
     @staticmethod
     @pytest.fixture
-    def file_created_event(path):
+    def link_path(file_path):
+        path = py.path.local('.'.join((file_path, 'lnk')))
+        path.mksymlinkto(file_path)
+        return str(path)
+
+    @staticmethod
+    @pytest.fixture(params=['file_path'])
+    def file_created_event(request):
+        path = request.getfuncargvalue(request.param)
         return watchdog.events.FileCreatedEvent(path)
 
-    def test_ignores_directory_event(self, log_event_handler, path):
-        event = watchdog.events.DirModifiedEvent(path)
+    def test_ignores_directory_event(self, log_event_handler, file_path):
+        event = watchdog.events.DirModifiedEvent(file_path)
         log_event_handler.dispatch(event)
         assert not log_event_handler.action.called
 
-    def test_ignores_file_deleted_event(self, log_event_handler, path):
-        event = watchdog.events.FileDeletedEvent(path)
+    def test_ignores_file_deleted_event(self, log_event_handler, file_path):
+        event = watchdog.events.FileDeletedEvent(file_path)
         log_event_handler.dispatch(event)
         assert not log_event_handler.action.called
 
     def test_handles_file_created_event(
-            self, log_event_handler, file_created_event, path):
+            self, log_event_handler, file_created_event, file_path):
         log_event_handler.dispatch(file_created_event)
-        log_event_handler.action.assert_called_once_with(path)
+        log_event_handler.action.assert_called_once_with(file_path)
 
-    def test_handles_file_moved_event(self, log_event_handler, path):
-        event = watchdog.events.FileMovedEvent('.'.join((path, 'old')), path)
+    def test_handles_file_moved_event(self, log_event_handler, file_path):
+        event = watchdog.events.FileMovedEvent(
+            '.'.join((file_path, 'old')), file_path)
         log_event_handler.dispatch(event)
-        log_event_handler.action.assert_called_once_with(path)
+        log_event_handler.action.assert_called_once_with(file_path)
 
-    def test_handles_file_modified_event(self, log_event_handler, path):
-        event = watchdog.events.FileModifiedEvent(path)
+    def test_handles_file_modified_event(self, log_event_handler, file_path):
+        event = watchdog.events.FileModifiedEvent(file_path)
         log_event_handler.dispatch(event)
-        log_event_handler.action.assert_called_once_with(path)
+        log_event_handler.action.assert_called_once_with(file_path)
 
     @pytest.mark.parametrize('log_event_handler_pattern', [r'no-match'])
     def test_event_target_does_not_match_pattern(
             self, log_event_handler, file_created_event):
+        log_event_handler.dispatch(file_created_event)
+        assert not log_event_handler.action.called
+
+    @pytest.mark.parametrize(
+        'file_created_event', ['link_path'], indirect=True)
+    def test_event_target_is_a_link(
+            self, log_event_handler, file_created_event):
+        log_event_handler.dispatch(file_created_event)
+        assert not log_event_handler.action.called
+
+    def test_event_target_does_not_exist(
+            self, log_event_handler, file_created_event):
+        os.unlink(file_created_event.src_path)
         log_event_handler.dispatch(file_created_event)
         assert not log_event_handler.action.called
 
@@ -462,6 +491,76 @@ class TestConfigureWatchers(object):
         assert_handlers_registered(expected_handlers)
 
 
+class TestProcessObservedFiles(object):
+    @staticmethod
+    @pytest.fixture
+    def watch_path(tmpdir):
+        return tmpdir
+
+    @staticmethod
+    @pytest.fixture
+    def watch_dir(watch_path):
+        return str(watch_path)
+
+    @staticmethod
+    @pytest.fixture
+    def emitter(watch_dir):
+        return mock.Mock(
+            spec=[],
+            watch=mock.Mock(
+                spec=[],
+                path=watch_dir),
+            queue_event=mock.Mock())
+
+    @staticmethod
+    @pytest.fixture
+    def observer(emitter):
+        return mock.Mock(
+            spec=[],
+            emitters=[emitter])
+
+    def test_empty_watch_dir(self, observer, emitter):
+        process_observed_files(observer)
+        assert not emitter.queue_event.called
+
+    def test_queues_files(self, watch_path, observer, emitter):
+        log_names = ['a.log', 'b.log']
+        log_paths = []
+        for log_name in log_names:
+            log_path = watch_path / log_name
+            log_path.write('')
+            log_paths.append(log_path)
+        process_observed_files(observer)
+        expected_queue_calls = [
+            mock.call(watchdog.events.FileCreatedEvent(str(p)))
+            for p in log_paths]
+        assert emitter.queue_event.mock_calls == expected_queue_calls
+
+    def test_skips_directories(self, watch_path, observer, emitter):
+        watch_path.mkdir('subdir')
+        process_observed_files(observer)
+        assert not emitter.queue_event.called
+
+
+class TestTimeInterval(object):
+    @pytest.mark.parametrize('value, expected', [
+        (1, 1.0),
+        ('1', 1.0),
+    ])
+    def test_valid(self, value, expected):
+        assert time_interval(value) == expected
+
+    @pytest.mark.parametrize('value, expected_reason', [
+        (None, 'not a number'),
+        ('d', 'not a number'),
+        (0, 'not positive'),
+    ])
+    def test_invalid(self, value, expected_reason):
+        with pytest.raises(argparse.ArgumentTypeError) as e:
+            time_interval(value)
+        assert expected_reason in str(e.value)
+
+
 class TestMain(object):
     @staticmethod
     @pytest.fixture
@@ -474,36 +573,76 @@ class TestMain(object):
         return tmpdir / 'config.yml'
 
     @staticmethod
+    @pytest.fixture
+    def sweep_interval():
+        return None
+
+    @staticmethod
     @pytest.fixture(autouse=True)
     def config_file(config_path, config):
         config_path.write(yaml.dump(config))
 
     @staticmethod
     @pytest.fixture
-    def args(config_path):
-        return ['--config', str(config_path)]
+    def args(config_path, sweep_interval):
+        result = ['--config', str(config_path)]
+        if sweep_interval is not None:
+            result.extend(['--sweep-interval', str(sweep_interval)])
+        return result
 
     @staticmethod
     @pytest.yield_fixture(autouse=True)
-    def mock_time():
-        with mock.patch.object(archive_logs, 'time') as time:
-            time.sleep.side_effect = KeyboardInterrupt
-            yield time
+    def mock_sleep():
+        with mock.patch.object(archive_logs, 'time', autospec=True) as time:
+            sleep = time.sleep
+            sleep.side_effect = KeyboardInterrupt
+            yield sleep
 
     @staticmethod
     @pytest.yield_fixture
     def mock_configure_watchers():
-        with mock.patch.object(archive_logs, 'configure_watchers') as cfg:
-            yield cfg
+        with mock.patch.object(
+                archive_logs, 'configure_watchers') as configure_watchers:
+            yield configure_watchers
 
-    def test_args_from_param(self, args, config, mock_configure_watchers):
-        main(args=args)
-        mock_configure_watchers.assert_called_once_with(config)
+    @staticmethod
+    @pytest.yield_fixture
+    def mock_process_observed_files():
+        with mock.patch.object(
+                archive_logs, 'process_observed_files') as process_files:
+            yield process_files
 
-    def test_args_from_argv(self, args, config, mock_configure_watchers):
+    @staticmethod
+    @pytest.fixture
+    def run_test(
+            config, sweep_interval, mock_configure_watchers,
+            mock_process_observed_files, mock_sleep):
+        def run(expected_sweeps=1, **main_kwargs):
+            main(**main_kwargs)
+            mock_configure_watchers.assert_called_once_with(config)
+            expected_sweep_calls = [
+                mock.call(mock_configure_watchers.return_value)
+                for _ in range(expected_sweeps)]
+            assert (
+                mock_process_observed_files.mock_calls == expected_sweep_calls)
+            expected_sleep_calls = [
+                mock.call(sweep_interval or 3600.0)
+                for _ in range(expected_sweeps)]
+            assert mock_sleep.mock_calls == expected_sleep_calls
+
+        return run
+
+    def test_args_from_param(self, args, run_test):
+        run_test(args=args)
+
+    def test_args_from_argv(self, args, run_test):
         with mock.patch.object(sys, 'argv', ['archive_logs'] + args):
-            main()
-        mock_configure_watchers.assert_called_once_with(config)
+            run_test()
+
+    @pytest.mark.parametrize('sweep_interval', [5])
+    def test_sweep_loop(self, args, run_test, mock_sleep):
+        mock_sleep.side_effect = [None, KeyboardInterrupt]
+        run_test(expected_sweeps=2, args=args)
 
     def test_observer_integration(self, args):
         main(args=args)

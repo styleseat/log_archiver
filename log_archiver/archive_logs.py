@@ -7,6 +7,7 @@ import fnmatch
 import hashlib
 import logging
 import os
+import os.path
 import re
 import sys
 import textwrap
@@ -46,7 +47,10 @@ class LogEventHandler(watchdog.events.FileSystemEventHandler):
         basename = os.path.basename(path)
         if self.pattern.match(basename):
             try:
-                self.action(path)
+                # The target path may no longer exist if it was processed
+                # by a preceding event.
+                if os.path.lexists(path) and not os.path.islink(path):
+                    self.action(path)
             except Exception:
                 logger.exception(
                     'Unable to complete action for path: %s' % (path,))
@@ -183,6 +187,27 @@ def configure_watchers(config):
     return observer
 
 
+def process_observed_files(observer):
+    for emitter in observer.emitters:
+        watch = emitter.watch
+        watch_dir = watch.path
+        for entry in os.listdir(watch_dir):
+            path = os.path.join(watch_dir, entry)
+            if os.path.isfile(path):
+                event = watchdog.events.FileCreatedEvent(path)
+                emitter.queue_event(event)
+
+
+def time_interval(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError('%s is not a number' % (value,))
+    if value < 1:
+        raise argparse.ArgumentTypeError('%r is not positive' % (value,))
+    return value
+
+
 def argument_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -214,6 +239,14 @@ def argument_parser():
         type=argparse.FileType('rb'),
         default='config.yml',
         help="YAML configuration file")
+    parser.add_argument(
+        '--sweep-interval',
+        type=time_interval,
+        default=3600.0,
+        help="""
+        Interval at which the archiver will sweep watched directories,
+        attempting to archive logs which previously could not be archived
+        """)
     return parser
 
 
@@ -229,7 +262,8 @@ def main(args=None):
     observer.start()
     try:
         while True:
-            time.sleep(1)
+            process_observed_files(observer)
+            time.sleep(args.sweep_interval)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
