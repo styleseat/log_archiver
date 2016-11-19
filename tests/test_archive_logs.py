@@ -6,11 +6,14 @@ import copy
 import datetime
 import fnmatch
 import functools
+import gzip
 import hashlib
+import io
 import os
 import random
 import re
 import sys
+import tempfile
 import uuid
 
 import mock
@@ -22,13 +25,17 @@ import yaml
 
 from log_archiver import archive_logs
 from log_archiver.archive_logs import (
-    LogEventHandler, S3Archiver, configure_watchers, main,
+    LogEventHandler, S3Archiver, configure_watchers, gzip_file, main,
     process_observed_files, time_interval)
 
 try:
     range = xrange
 except NameError:
     pass
+
+
+def iter_random_bytes(n):
+    return (random.getrandbits(8) for _ in range(n))
 
 
 @pytest.fixture
@@ -137,28 +144,12 @@ class TestS3Archiver(object):
 
     @staticmethod
     @pytest.fixture
-    def dest_options():
-        return None
+    def archiver_factory(dest_url, log_name, filename_format):
+        def factory(**kwargs):
+            return S3Archiver(
+                dest_url, log_name, filename_format, **kwargs)
 
-    @staticmethod
-    @pytest.fixture
-    def fingerprint_method():
-        return S3Archiver.FINGERPRINT_DATA
-
-    @staticmethod
-    @pytest.fixture
-    def archiver_factory(
-            dest_url, log_name, filename_format, dest_options,
-            fingerprint_method):
-        return functools.partial(
-            S3Archiver, dest_url, log_name, filename_format,
-            dest_options=dest_options,
-            fingerprint_method=fingerprint_method)
-
-    @staticmethod
-    @pytest.fixture
-    def archiver(archiver_factory):
-        return archiver_factory()
+        return factory
 
     @staticmethod
     @pytest.fixture
@@ -168,7 +159,18 @@ class TestS3Archiver(object):
     @staticmethod
     @pytest.fixture
     def log_data():
-        return bytearray(random.getrandbits(8) for _ in range(32))
+        return bytearray(iter_random_bytes(32))
+
+    @staticmethod
+    @pytest.fixture
+    def compressor():
+        def compress(data):
+            compressed = io.BytesIO()
+            with gzip.GzipFile(fileobj=compressed, mode='wb') as gz:
+                gz.write(bytes(data))
+            return compressed.getvalue()
+
+        return compress
 
     @staticmethod
     @pytest.fixture
@@ -177,7 +179,6 @@ class TestS3Archiver(object):
             fingerprint_data = log_data
         else:
             fingerprint_data = log_path.basename.encode('utf-8')
-        print('Fingerprint data: %s' % (fingerprint_data,))
         return base64.urlsafe_b64encode(
             hashlib.sha1(fingerprint_data).digest()).rstrip(b'=')
 
@@ -192,6 +193,17 @@ class TestS3Archiver(object):
     def patched_datetime_class(mock_datetime_module, mock_datetime_class):
         with mock.patch.object(archive_logs, 'datetime', mock_datetime_module):
             yield mock_datetime_class
+
+    def test_init_minimal_params(
+            self, archiver_factory, dest_url, log_name, filename_format):
+        archiver = archiver_factory()
+        assert isinstance(archiver.bucket, type(''))
+        assert archiver.path_prefix == ''
+        assert archiver.log_name == log_name
+        assert archiver.filename_format == filename_format
+        assert archiver.fingerprint_method == S3Archiver.FINGERPRINT_DATA
+        assert archiver.compress is False
+        assert archiver.s3_options == {'region': None}
 
     @pytest.mark.parametrize('dest_url', [
         # unsupported scheme
@@ -248,14 +260,14 @@ class TestS3Archiver(object):
     ])
     def test_init_dest_options_are_not_none(
             self, archiver_factory, dest_options, expected_s3_options):
-        archiver = archiver_factory()
+        archiver = archiver_factory(dest_options=dest_options)
         assert archiver.s3_options == expected_s3_options
 
     @pytest.mark.parametrize('fingerprint_method', ['invalid'])
     def test_init_fingerprint_method_is_invalid(
             self, archiver_factory, fingerprint_method):
         with pytest.raises(ValueError):
-            archiver_factory()
+            archiver_factory(fingerprint_method=fingerprint_method)
 
     @pytest.mark.parametrize('fingerprint_method', [
         S3Archiver.FINGERPRINT_DATA,
@@ -263,19 +275,27 @@ class TestS3Archiver(object):
     ])
     def test_init_fingerprint_method_is_valid(
             self, archiver_factory, fingerprint_method):
-        archiver = archiver_factory()
+        archiver = archiver_factory(fingerprint_method=fingerprint_method)
         assert archiver.fingerprint_method == fingerprint_method
+
+    def test_init_compress_enabled(self, archiver_factory):
+        archiver = archiver_factory(compress=True)
+        assert archiver.compress is True
 
     @pytest.mark.parametrize('fingerprint_method', [
         S3Archiver.FINGERPRINT_DATA,
         S3Archiver.FINGERPRINT_NAME,
     ])
+    @pytest.mark.parametrize('compress', [False, True])
     def test_call(
-            self, archiver, log_name, filename_format, fingerprint_method,
-            log_path, log_data, fingerprint, mock_boto,
-            patched_datetime_class):
+            self, archiver_factory, log_name, filename_format,
+            fingerprint_method, compress, log_path, log_data, fingerprint,
+            compressor, mock_boto, patched_datetime_class):
         region = 'us-west-1'
         extra_args = dict(sse='aws:kms')
+        archiver = archiver_factory(
+            fingerprint_method=fingerprint_method,
+            compress=compress)
         archiver.s3_options = dict(
             region=region,
             extra_args=copy.deepcopy(extra_args))
@@ -292,23 +312,62 @@ class TestS3Archiver(object):
             log_name=log_name,
             timestamp='20110102030405',
             fingerprint=fingerprint)
+        if compress:
+            filename += '.gz'
         key = archiver.path_prefix + '/'.join((
             log_name,
             '2011',
             '01',
             '02',
             filename))
-        s3_object = mock.Mock()
-        mock_boto.resource.return_value = mock.Mock(Object=s3_object)
+        s3_object = mock.Mock(
+            spec=['bucket_name', 'key', 'upload_fileobj'])
+        s3_object_class = mock.Mock(return_value=s3_object)
+        mock_boto.resource.return_value = mock.Mock(Object=s3_object_class)
+        uploaded_data = bytearray()
+
+        def upload_fileobj(fileobj, **kwargs):
+            uploaded_data.extend(fileobj.read())
+
+        s3_object.upload_fileobj.side_effect = upload_fileobj
+
         archiver(str(log_path))
+
         mock_boto.resource.assert_called_once_with(
             's3',
             region_name=region,
             config=mock.ANY)
-        s3_object.assert_called_once_with(archiver.bucket, key)
-        s3_object.return_value.upload_file.assert_called_once_with(
-            str(log_path), ExtraArgs=dict(extra_args, Metadata=metadata))
+        s3_object_class.assert_called_once_with(archiver.bucket, key)
+        s3_object.upload_fileobj.assert_called_once_with(
+            mock.ANY, ExtraArgs=dict(extra_args, Metadata=metadata))
+        expected_payload = compressor(log_data) if compress else log_data
+        assert uploaded_data == expected_payload
         assert not log_path.check()
+
+
+class TestGzipFile(object):
+    @staticmethod
+    @pytest.yield_fixture(autouse=True)
+    def override_tempdir(tmpdir):
+        with mock.patch.object(tempfile, 'tempdir', str(tmpdir)):
+            yield
+
+    @staticmethod
+    @pytest.fixture
+    def data(request):
+        return bytearray(iter_random_bytes(request.param))
+
+    @pytest.mark.parametrize('data', [0, 32, 128, 1024], indirect=True)
+    def test_gzip(self, data, tmpdir):
+        path = tmpdir / 'uncompressed'
+        path.write(data)
+        with gzip_file(str(path)) as gzf:
+            compressed = gzf.read()
+        path.remove()
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode='rb') as gzf:
+            uncompressed = gzf.read()
+        assert uncompressed == data
+        assert tmpdir.listdir() == []
 
 
 class TestConfigureWatchers(object):
@@ -349,7 +408,7 @@ class TestConfigureWatchers(object):
             '{log_name}',
             '{timestamp}',
             mock_get_instance_id.return_value,
-            '{fingerprint}'))
+            '{fingerprint}.log'))
 
     @staticmethod
     @pytest.fixture
@@ -436,8 +495,7 @@ class TestConfigureWatchers(object):
                 dict(
                     dirname='/log',
                     pattern='*.log',
-                    dest_options={},
-                    fingerprint_method=S3Archiver.FINGERPRINT_DATA)],
+                    dest_options={})],
         ),
         # maximal log config
         (
@@ -447,13 +505,15 @@ class TestConfigureWatchers(object):
                     dest_url='s3://bucket',
                     name='events',
                     dest_options={'region': 'us-west-1'},
-                    fingerprint=S3Archiver.FINGERPRINT_NAME)],
+                    fingerprint_method=S3Archiver.FINGERPRINT_NAME,
+                    compress=True)],
             [
                 dict(
                     dirname='/log',
                     pattern='*.log',
                     dest_options={'region': 'us-west-1'},
-                    fingerprint_method=S3Archiver.FINGERPRINT_NAME)],
+                    fingerprint_method=S3Archiver.FINGERPRINT_NAME,
+                    compress=True)],
         ),
         # multiple logs
         (
@@ -470,13 +530,11 @@ class TestConfigureWatchers(object):
                 dict(
                     dirname='/log/src1',
                     pattern='*.log',
-                    dest_options={},
-                    fingerprint_method=S3Archiver.FINGERPRINT_DATA),
+                    dest_options={}),
                 dict(
                     dirname='/log/src2',
                     pattern='*.log',
-                    dest_options={},
-                    fingerprint_method=S3Archiver.FINGERPRINT_DATA)],
+                    dest_options={})],
         ),
     ])
     def test_logs(

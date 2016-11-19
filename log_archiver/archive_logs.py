@@ -2,14 +2,18 @@ from __future__ import absolute_import
 
 import argparse
 import base64
+import contextlib
 import datetime
 import fnmatch
+import gzip
 import hashlib
 import logging
 import os
 import os.path
 import re
+import shutil
 import sys
+import tempfile
 import textwrap
 import time
 
@@ -27,6 +31,15 @@ except ImportError:
     import urllib.parse as urlparse
 
 logger = logging.getLogger('archive_logs')
+
+
+@contextlib.contextmanager
+def gzip_file(path):
+    with open(path, 'rb') as data, tempfile.TemporaryFile() as compressed:
+        with gzip.GzipFile(fileobj=compressed, mode='wb') as compressor:
+            shutil.copyfileobj(data, compressor)
+        compressed.seek(0)
+        yield compressed
 
 
 class LogEventHandler(watchdog.events.FileSystemEventHandler):
@@ -54,7 +67,7 @@ class LogEventHandler(watchdog.events.FileSystemEventHandler):
                     self.action(path)
             except Exception:
                 logger.exception(
-                    'Unable to complete action for path: %s' % (path,))
+                    'Unable to complete action for path: %s', path)
 
 
 class S3Archiver(object):
@@ -66,7 +79,8 @@ class S3Archiver(object):
     def __init__(
             self, dest_url, log_name, filename_format,
             dest_options=None,
-            fingerprint_method=FINGERPRINT_DATA):
+            fingerprint_method=FINGERPRINT_DATA,
+            compress=False):
         """Initialize an s3 archiver.
 
         :param str dest_url: The URL of the destination which will store
@@ -87,6 +101,7 @@ class S3Archiver(object):
         :kwarg str fingerprint_method: The method used to fingerprint the log's
             contents. One of the `FINGERPRINT_DATA` or `FINGERPRINT_NAME`
             members in this class.
+        :kwarg bool compress: If `True`, the archive data will be compressed.
         """
         dest = urlparse.urlparse(dest_url)
         if dest.scheme != 's3':
@@ -108,6 +123,7 @@ class S3Archiver(object):
             raise ValueError(
                 'Invalid fingerprint method: %s' % (fingerprint_method,))
         self.fingerprint_method = fingerprint_method
+        self.compress = compress
 
     def _make_s3_options(self, options):
         result = dict(
@@ -143,6 +159,8 @@ class S3Archiver(object):
             log_name=self.log_name,
             timestamp=now.strftime('%Y%m%d%H%M%S'),
             fingerprint=fingerprint)
+        if self.compress:
+            filename = '.'.join((filename, 'gz'))
         key = '/'.join((
             self.log_name,
             now.strftime('%Y'),
@@ -157,9 +175,14 @@ class S3Archiver(object):
             region_name=s3_options['region'],
             config=botocore.client.Config(signature_version='s3v4'))
         s3_object = s3.Object(self.bucket, ''.join((self.path_prefix, key)))
-        s3_object.upload_file(
-            path,
-            ExtraArgs=extra_args)
+        logger.info(
+            'Archiving %s as s3://%s/%s',
+            path, s3_object.bucket_name, s3_object.key)
+        prepare_data = gzip_file(path) if self.compress else open(path, 'rb')
+        with prepare_data as object_data:
+            s3_object.upload_fileobj(
+                object_data,
+                ExtraArgs=extra_args)
         os.unlink(path)
 
 
@@ -172,16 +195,21 @@ def configure_watchers(config):
             '{log_name}',
             '{timestamp}',
             instance_id,
-            '{fingerprint}'))
+            '{fingerprint}.log'))
         dest_options = dict(default_s3_options)
         dest_options.update(log.get('dest_options') or {})
+        archiver_opts = {}
+        for opt in ('fingerprint_method', 'compress'):
+            try:
+                archiver_opts[opt] = log[opt]
+            except KeyError:
+                pass
         archiver = S3Archiver(
             log['dest_url'],
             log['name'],
             filename_format,
             dest_options=dest_options,
-            fingerprint_method=log.get(
-                'fingerprint', S3Archiver.FINGERPRINT_DATA))
+            **archiver_opts)
         dirname, basename = os.path.split(log['src'])
         if not (dirname and basename):
             raise ValueError('Invalid source: %s' % (log['src'],))
@@ -235,7 +263,9 @@ def argument_parser():
                     dest_url: Destination s3 url for archives
                     dest_options: (optional) s3 options for the log;
                                   see s3, above, for a list of options
-                    fingerprint: (optional) Fingerprint method; can be one of name|data
+                    fingerprint_method: (optional) Fingerprint method;
+                                        can be one of name|data
+                    compress: (optional) true to compress data
                   ...
             """))  # noqa
     parser.add_argument(
